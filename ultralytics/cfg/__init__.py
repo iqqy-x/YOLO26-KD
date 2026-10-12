@@ -311,7 +311,7 @@ CFG_BOOL_KEYS = frozenset(
         "cls_remap",
     }
 )
-CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment"})
+CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment", "distill_method"})
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:
@@ -533,6 +533,9 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         )
                 else:
                     cfg[k] = scheme
+
+    if "distill_method" in cfg and cfg["distill_method"] not in {"sl2", "cankd"}:
+        raise ValueError("'distill_method' must be 'sl2' or 'cankd'.")
 
 
 def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:

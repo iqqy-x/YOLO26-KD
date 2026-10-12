@@ -186,13 +186,16 @@ def test_resume_invalid_checkpoint_args(tmp_path):
         detect.DetectionTrainer(overrides={"model": MODEL, "data": "coco8.yaml", "resume": str(last)})
 
 
-def test_distill_resume(tmp_path: Path):
+@pytest.mark.parametrize("distill_method", ("sl2", "cankd"))
+def test_distill_resume(tmp_path: Path, distill_method: str):
     """Test knowledge distillation resumes from an incomplete checkpoint."""
     overrides = {
         "data": "coco8.yaml",
         "model": "yolo26n.yaml",
         "distill_model": WEIGHTS_DIR / "yolo26s.pt",
-        "imgsz": 32,
+        "distill_method": distill_method,
+        "dis": 10.0 if distill_method == "cankd" else 6.0,
+        "imgsz": 128 if distill_method == "cankd" else 32,
         "multi_scale": 0.5,  # vary per-batch image size to exercise dynamic distillation score splitting
         "epochs": 2,
         "save": True,
@@ -218,10 +221,20 @@ def test_distill_resume(tmp_path: Path):
     assert isinstance(ckpt["ema"], DistillationModel), "distillation EMA wraps the student model"
     assert ckpt["ema"].teacher_model is None, "teacher should be stripped from the EMA/checkpoint"
     assert ckpt["ema"].projector is not None, "the distillation projector should be persisted in the EMA checkpoint"
+    assert ckpt["ema"].distill_method == distill_method
+    projector_state = {k: v.float().clone() for k, v in ckpt["ema"].projector.state_dict().items()}
 
     overrides["resume"] = trainer.last
     trainer = detect.DetectionTrainer(overrides=overrides)
     trainer.final_eval = lambda: None
+
+    def check_restored_modules(trainer):
+        restored = unwrap_model(trainer.model)
+        assert restored.distill_method == distill_method
+        for key, value in restored.projector.state_dict().items():
+            torch.testing.assert_close(value.float(), projector_state[key], rtol=0, atol=0)
+
+    trainer.add_callback("on_train_start", check_restored_modules)
     trainer.train()
     model = unwrap_model(trainer.model)
     assert isinstance(model, DistillationModel), "resume should rebuild the DistillationModel"

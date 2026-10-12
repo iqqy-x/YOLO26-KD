@@ -12,6 +12,18 @@ keywords: Ultralytics, ultralytics.nn.distill_model, API reference, YOLO, Python
 
 <br>
 
+## ::: ultralytics.nn.distill_model.CanAttentionMatrix
+
+<br><br><hr><br>
+
+## ::: ultralytics.nn.distill_model.CanNonLocalAttention
+
+<br><br><hr><br>
+
+## ::: ultralytics.nn.distill_model.CanKDLoss
+
+<br><br><hr><br>
+
 ## ::: ultralytics.nn.distill_model.FeatureHook
 
 <br><br><hr><br>

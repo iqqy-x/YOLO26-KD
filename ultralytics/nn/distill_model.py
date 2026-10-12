@@ -14,6 +14,135 @@ from ultralytics.utils.torch_utils import copy_attr
 from .tasks import load_checkpoint
 
 
+class CanAttentionMatrix(nn.Module):
+    """Compute the official CanKD dot-product affinity between student queries and teacher keys."""
+
+    def __init__(self, in_channels: int, inter_channels: int, dimension: int = 3, sub_sample: bool = True) -> None:
+        """Build query/key embeddings and optional teacher-key pooling as in CanKD's attentionMatrix."""
+        super().__init__()
+        assert dimension in [1, 2, 3]
+        self.dimension = dimension
+        self.sub_sample = sub_sample
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels
+        if dimension == 3:
+            conv_nd = nn.Conv3d
+            max_pool_layer = nn.MaxPool3d(kernel_size=(1, 2, 2))
+        elif dimension == 2:
+            conv_nd = nn.Conv2d
+            max_pool_layer = nn.MaxPool2d(kernel_size=(2, 2))
+        else:
+            conv_nd = nn.Conv1d
+            max_pool_layer = nn.MaxPool1d(kernel_size=2)
+        self.theta = conv_nd(in_channels, inter_channels, kernel_size=1, stride=1, padding=0)
+        self.phi = conv_nd(in_channels, inter_channels, kernel_size=1, stride=1, padding=0)
+        if sub_sample:
+            self.phi = nn.Sequential(self.phi, max_pool_layer)
+
+    def forward(self, y_s: torch.Tensor, y_t: torch.Tensor) -> torch.Tensor:
+        """Return dot products divided by the number of teacher reference positions, without softmax."""
+        assert y_s.shape == y_t.shape
+        batch_size = y_s.size(0)
+        theta_y_s = self.theta(y_s).view(batch_size, self.inter_channels, -1).permute(0, 2, 1)
+        phi_y_t = self.phi(y_t).view(batch_size, self.inter_channels, -1)
+        f = torch.matmul(theta_y_s, phi_y_t)
+        return f / f.size(-1)
+
+
+class CanNonLocalAttention(nn.Module):
+    """Transform student features with teacher values and the official CanKD residual connection."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        inter_channels: int | None = None,
+        dimension: int = 3,
+        sub_sample: bool = True,
+        bn_layer: bool = True,
+    ) -> None:
+        """Build the Can block, including the zero-initialized output projection or BatchNorm scale."""
+        super().__init__()
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels
+        self.att = CanAttentionMatrix(in_channels, inter_channels, dimension, sub_sample)
+        if dimension == 3:
+            conv_nd = nn.Conv3d
+            max_pool_layer = nn.MaxPool3d(kernel_size=(1, 2, 2))
+            bn = nn.BatchNorm3d
+        elif dimension == 2:
+            conv_nd = nn.Conv2d
+            max_pool_layer = nn.MaxPool2d(kernel_size=(2, 2))
+            bn = nn.BatchNorm2d
+        else:
+            conv_nd = nn.Conv1d
+            max_pool_layer = nn.MaxPool1d(kernel_size=2)
+            bn = nn.BatchNorm1d
+        self.g = conv_nd(in_channels, inter_channels, kernel_size=1, stride=1, padding=0)
+        if bn_layer:
+            self.W = nn.Sequential(
+                conv_nd(inter_channels, in_channels, kernel_size=1, stride=1, padding=0), bn(in_channels)
+            )
+            nn.init.constant_(self.W[1].weight, 0)
+            nn.init.constant_(self.W[1].bias, 0)
+        else:
+            self.W = conv_nd(inter_channels, in_channels, kernel_size=1, stride=1, padding=0)
+            nn.init.constant_(self.W.weight, 0)
+            nn.init.constant_(self.W.bias, 0)
+        if sub_sample:
+            self.g = nn.Sequential(self.g, max_pool_layer)
+
+    def forward(self, y_s: torch.Tensor, y_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the enhanced student and unchanged teacher features."""
+        assert y_s.shape == y_t.shape
+        batch_size = y_s.size(0)
+        f_div_C = self.att(y_s, y_t)
+        g_y_t = self.g(y_t).view(batch_size, self.inter_channels, -1).permute(0, 2, 1)
+        y_s_ = torch.matmul(f_div_C, g_y_t).permute(0, 2, 1).contiguous()
+        y_s_ = y_s_.view(batch_size, self.inter_channels, *y_s.size()[2:])
+        return self.W(y_s_) + y_s, y_t
+
+
+class CanKDLoss(nn.Module):
+    """Port of CanKD's NLKD_IN_Loss: instance-normalized MSE / 2 with trainable cross-attention.
+
+    The operations and state-dict layout follow ``CanKD/mmrazor/models/losses/nlkd_IN_loss.py`` from
+    https://github.com/tori-hotaru/CanKD (Apache-2.0). Alignment is external to this loss, as in the official configs.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        inter_channels: int | None = None,
+        dimension: int = 2,
+        sub_sample: bool = True,
+        bn_layer: bool = True,
+        tau: float = 1.0,
+        loss_weight: float = 1.0,
+    ) -> None:
+        """Initialize with the official defaults; tau is retained but unused by the original computation."""
+        super().__init__()
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels if inter_channels else in_channels // 2
+        if self.inter_channels == 0:
+            self.inter_channels = 1
+        self.tau = tau
+        self.loss_weight = loss_weight
+        self.non_local_att = CanNonLocalAttention(in_channels, self.inter_channels, dimension, sub_sample, bn_layer)
+        self.in_norm = nn.InstanceNorm2d(in_channels, affine=False)
+
+    def norm(self, feat: torch.Tensor) -> torch.Tensor:
+        """Normalize each sample/channel exactly as the official InstanceNorm2d layer."""
+        return self.in_norm(feat)
+
+    def forward(self, s_feature: torch.Tensor, t_feature: torch.Tensor) -> torch.Tensor:
+        """Compute the official mean MSE / 2, applying loss_weight exactly once."""
+        assert s_feature.shape == t_feature.shape
+        z_s, z_t = self.non_local_att(s_feature, t_feature)
+        n_z_s, n_z_t = self.norm(z_s), self.norm(z_t)
+        loss = F.mse_loss(n_z_s, n_z_t) / 2
+        return loss * self.loss_weight
+
+
 class FeatureHook:
     """Picklable forward hook that stores layer output into a shared dict."""
 
@@ -41,7 +170,8 @@ class DistillationModel(nn.Module):
         student_model (nn.Module): Trainable student model being distilled.
         feats_idx (list): Student layer indices for feature extraction.
         teacher_feats_idx (list): Teacher layer indices at the same feature levels.
-        projector (nn.ModuleList): MLP projector aligning student features to teacher dimensions.
+        projector (nn.ModuleList): Per-level MLP projectors, or CanKD channel aligners and losses.
+        distill_method (str): Distillation method, either "sl2" or "cankd".
         dis (float): Distillation loss weight factor.
 
     Methods:
@@ -105,10 +235,28 @@ class DistillationModel(nn.Module):
 
         copy_attr(self, student_model)
         self.dis = self.student_model.args.dis
+        self.distill_method = getattr(self.student_model.args, "distill_method", "sl2")
+        if self.distill_method not in {"sl2", "cankd"}:
+            raise ValueError("distill_method must be 'sl2' or 'cankd'")
         projectors = []
         for student_out, teacher_out in zip(student_output[:-1], teacher_output[:-1]):
             student_dim = self.decouple_outputs(student_out).shape[1]
             teacher_dim = self.decouple_outputs(teacher_out).shape[1]
+            if self.distill_method == "cankd":
+                align = nn.Conv2d(student_dim, teacher_dim, 1) if student_dim != teacher_dim else nn.Identity()
+                if isinstance(align, nn.Conv2d):
+                    # Match the official ConvModuleConnector with norm_cfg=None and act_cfg=None.
+                    nn.init.kaiming_normal_(align.weight, a=0, mode="fan_out", nonlinearity="relu")
+                    nn.init.constant_(align.bias, 0)
+                projectors.append(
+                    nn.ModuleDict(
+                        {
+                            "align": align,
+                            "loss": CanKDLoss(in_channels=teacher_dim, loss_weight=self.dis),
+                        }
+                    )
+                )
+                continue
             projectors.append(
                 nn.Sequential(
                     nn.Conv2d(student_dim, teacher_dim, kernel_size=1, stride=1, padding=0),
@@ -264,21 +412,27 @@ class DistillationModel(nn.Module):
 
         regular_loss, loss_items = self.student_model.loss(batch, preds)
         n = len(self.feats_idx) - 1  # neck levels; level n is the Detect head
-        teacher_head_feat = self._teacher_feats[n]
-        teacher_scores = (
-            self.decouple_outputs(teacher_head_feat, branch="one2many")["scores"]
-            + self.decouple_outputs(teacher_head_feat, branch="one2one")["scores"]
-        ) / 2
-        # neck feature sizes vary per batch (e.g. multi_scale), so split scores by the live teacher feats
-        neck_feats = [self._teacher_feats[i] for i in range(n)]
-        parts = torch.split(teacher_scores, [f.shape[-2] * f.shape[-1] for f in neck_feats], dim=-1)
-        teacher_scores = tuple(p.sigmoid().max(dim=1, keepdim=True).values for p in parts)
+        if self.distill_method == "sl2":
+            teacher_head_feat = self._teacher_feats[n]
+            teacher_scores = (
+                self.decouple_outputs(teacher_head_feat, branch="one2many")["scores"]
+                + self.decouple_outputs(teacher_head_feat, branch="one2one")["scores"]
+            ) / 2
+            # neck feature sizes vary per batch (e.g. multi_scale), so split scores by the live teacher feats
+            neck_feats = [self._teacher_feats[i] for i in range(n)]
+            parts = torch.split(teacher_scores, [f.shape[-2] * f.shape[-1] for f in neck_feats], dim=-1)
+            teacher_scores = tuple(p.sigmoid().max(dim=1, keepdim=True).values for p in parts)
         for i in range(n):
             teacher_feat = self.decouple_outputs(self._teacher_feats[i])
-            student_feat = self.projector[i](self.decouple_outputs(self._student_feats[i]))
-            loss_distill += (
-                self.loss_sl2(student_feat, teacher_feat, feat_idx=i, teacher_scores=teacher_scores) * self.dis
-            )
+            student_feat = self.decouple_outputs(self._student_feats[i])
+            if self.distill_method == "cankd":
+                level = self.projector[i]
+                loss_distill += level["loss"](level["align"](student_feat), teacher_feat)
+            else:
+                student_feat = self.projector[i](student_feat)
+                loss_distill += (
+                    self.loss_sl2(student_feat, teacher_feat, feat_idx=i, teacher_scores=teacher_scores) * self.dis
+                )
 
         loss_items["dis_loss"] = loss_distill.detach()
         loss_distill = loss_distill * batch["img"].shape[0]

@@ -79,12 +79,15 @@ Cross-family distillation (e.g., YOLO11 teacher with YOLO26 student) is **not su
 
 ## Key Parameters
 
-| Parameter       | Type    | Default | Description                                                                                               |
-| --------------- | ------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `distill_model` | `str`   | `None`  | Path to the teacher model file (e.g., `yolo26x.pt`). Setting this enables knowledge distillation.         |
-| `dis`           | `float` | `6.0`   | Distillation loss weight. Controls how much the distillation loss contributes to the total training loss. |
+| Parameter        | Type    | Default | Description                                                                                                         |
+| ---------------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| `distill_model`  | `str`   | `None`  | Path to the teacher model file (e.g., `yolo26x.pt`). Setting this enables knowledge distillation.                   |
+| `distill_method` | `str`   | `'sl2'` | Loss method: built-in score-weighted L2 (`sl2`) or cross-attention non-local distillation (`cankd`).                |
+| `dis`            | `float` | `6.0`   | Distillation loss weight. CanKD applies this once to `mean MSE / 2`; use `10.0` for the official detection setting. |
 
 ## How It Works
+
+The default `distill_method="sl2"` follows these steps:
 
 1. The **teacher model** remains frozen in `eval` mode and runs inference on each batch
 2. The **student model** trains with standard task losses plus distillation guidance
@@ -104,6 +107,46 @@ flowchart TD
     L -->|× dis| W
     W --> B([Update student, projector])
 ```
+
+### CanKD
+
+Set `distill_method="cankd"` to use [CanKD](https://github.com/tori-hotaru/CanKD), following the official
+`NLKD_IN_Loss` implementation and the [paper](https://arxiv.org/abs/2511.21503). For each neck feature level:
+
+1. A single **1×1 convolution**, without activation or normalization, aligns student channels to teacher channels when
+   they differ. Its Kaiming-normal fan-out initialization and zero bias match the official `ConvModuleConnector`.
+2. Student queries and teacher keys form a **dot-product affinity divided by the number of pooled teacher positions**,
+   without softmax or temperature scaling.
+3. **2×2 max pooling** is applied to teacher key and value embeddings. Their embedding width is half the teacher channels.
+4. The attended teacher values pass through a **1×1 convolution and BatchNorm**, whose scale and bias start at zero,
+   then are added to the aligned student features through a residual connection.
+5. **Instance Normalization** (`affine=False`) is applied to both enhanced student and teacher features, followed by
+   **mean MSE / 2 × dis**. Losses are summed across feature levels and use the same batch scaling as the built-in KD loss.
+
+The original student features continue to feed the detection head. CanKD does not use teacher confidence weights.
+Aligners and Can blocks are trained, included in EMA, and restored together on resume; inference and export retain only
+the student. YOLO26 uses its existing P3–P5 features, with no model YAML changes. Each feature map must be at least
+2×2 for the official pooling operation, including when multi-scale training changes the image size.
+
+```python
+from ultralytics import YOLO
+
+student = YOLO("yolo26n.pt")
+student.train(
+    data="dataset.yaml",
+    distill_model="teacher_yolo26s.pt",  # teacher already fine-tuned on the target dataset
+    distill_method="cankd",
+    dis=10.0,  # official loss_weight=10 gives 5 × mean MSE
+)
+```
+
+```bash
+yolo train model=yolo26n.pt data=dataset.yaml distill_model=teacher_yolo26s.pt distill_method=cankd dis=10.0
+```
+
+For a built-in KD comparison, use `distill_method="sl2"`. Keep the teacher checkpoint, student initialization, dataset
+splits, and training settings consistent, and select loss weights on the validation split. This ports the CanKD method to
+YOLO; it does not reproduce the paper's OpenMMLab detector experiments or the additional CanKD† weight-inheritance setting.
 
 ## Task Support
 
