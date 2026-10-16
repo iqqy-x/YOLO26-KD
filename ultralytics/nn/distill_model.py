@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ultralytics.nn.modules.head import Detect
-from ultralytics.utils.torch_utils import copy_attr
+from ultralytics.utils.torch_utils import autocast, copy_attr
 
 from .tasks import load_checkpoint
 
@@ -427,7 +427,9 @@ class DistillationModel(nn.Module):
             student_feat = self.decouple_outputs(self._student_feats[i])
             if self.distill_method == "cankd":
                 level = self.projector[i]
-                loss_distill += level["loss"](level["align"](student_feat), teacher_feat)
+                # Keep alignment and unnormalized attention products in FP32 under AMP.
+                with autocast(enabled=False, device=student_feat.device.type):
+                    loss_distill += level["loss"](level["align"](student_feat.float()), teacher_feat.float())
             else:
                 student_feat = self.projector[i](student_feat)
                 loss_distill += (

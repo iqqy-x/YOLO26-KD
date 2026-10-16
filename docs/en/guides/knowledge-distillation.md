@@ -128,6 +128,9 @@ Aligners and Can blocks are trained, included in EMA, and restored together on r
 the student. YOLO26 uses its existing P3–P5 features, with no model YAML changes. Each feature map must be at least
 2×2 for the official pooling operation, including when multi-scale training changes the image size.
 
+Feature alignment and the CanKD loss run in FP32, including when `amp=True`. Teacher and student forward passes
+continue to follow the trainer's AMP setting.
+
 ```python
 from ultralytics import YOLO
 
