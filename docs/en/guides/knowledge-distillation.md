@@ -45,6 +45,8 @@ Train a smaller student model with guidance from a larger teacher model by addin
 
 ## Performance
 
+The results in this section report the built-in `sl2` method, rather than CanKD or BTKD++.
+
 Knowledge distillation improves student [mAP](yolo-performance-metrics.md) across the entire YOLO26 family on [COCO](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml), with no added inference cost. The table below compares the standard YOLO26 models (baseline) against the same models trained with distillation from their recommended teacher.
 
 | Model                                                                  | size<br><sup>(pixels)</sup> | mAP<sup>val<br>50-95</sup><br>baseline | mAP<sup>val<br>50-95</sup><br>distilled | mAP<sup>val<br>50-95 (e2e)</sup><br>baseline | mAP<sup>val<br>50-95 (e2e)</sup><br>distilled |
@@ -79,11 +81,11 @@ Cross-family distillation (e.g., YOLO11 teacher with YOLO26 student) is **not su
 
 ## Key Parameters
 
-| Parameter        | Type    | Default | Description                                                                                                         |
-| ---------------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
-| `distill_model`  | `str`   | `None`  | Path to the teacher model file (e.g., `yolo26x.pt`). Setting this enables knowledge distillation.                   |
-| `distill_method` | `str`   | `'sl2'` | Loss method: built-in score-weighted L2 (`sl2`) or cross-attention non-local distillation (`cankd`).                |
-| `dis`            | `float` | `6.0`   | Distillation loss weight. CanKD applies this once to `mean MSE / 2`; use `10.0` for the official detection setting. |
+| Parameter        | Type    | Default | Description                                                                                                             |
+| ---------------- | ------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `distill_model`  | `str`   | `None`  | Path to the teacher model file (e.g., `yolo26x.pt`). Setting this enables knowledge distillation.                       |
+| `distill_method` | `str`   | `'sl2'` | Loss method: score-weighted L2 (`sl2`), cross-attention non-local distillation (`cankd`), or BTKD++ detection (`btkd`). |
+| `dis`            | `float` | `6.0`   | Distillation loss weight. CanKD applies this once to `mean MSE / 2`; use `10.0` for the official detection setting.     |
 
 ## How It Works
 
@@ -151,9 +153,58 @@ For a built-in KD comparison, use `distill_method="sl2"`. Keep the teacher check
 splits, and training settings consistent, and select loss weights on the validation split. This ports the CanKD method to
 YOLO; it does not reproduce the paper's OpenMMLab detector experiments or the additional CanKD† weight-inheritance setting.
 
+### BTKD++ for Object Detection
+
+Set `distill_method="btkd"` to use the object detection extension of
+[BTKD++](https://doi.org/10.1007/s11263-026-02924-x), following Sections 3.3-4.1 and Appendix A:
+
+1. Temporary hooks observe the student criterion's existing task-aligned assignments. Teacher and student outputs
+   use the same assigned positive grid positions; assignment is neither changed nor repeated.
+2. A positive is easy when the teacher predicts the assigned class correctly and its box IoU is at least **0.65**.
+   Other positives are hard. Background positions do not receive this additional loss.
+3. Class logits use temperature **2**. Each decoded box coordinate is represented by a truncated Gaussian over
+   **128 bins**, with standard deviation **2 bins**. GT coordinates identify one-hot target bins.
+4. Hard targets use proportional label-guided rectification on probabilities: only the GT/wrong-argmax pair changes,
+   preserving its total probability mass and every other entry. Already-correct pairs remain unchanged.
+5. Easy and hard KL losses are normalized separately. The linear curriculum is
+   `gamma = (epoch + 1) / epochs` for the trainer's zero-based epoch index. The added loss is
+   `dis * ((1 - gamma) * easy_loss + gamma * hard_loss)`; box losses sum over the four coordinates.
+
+For anchor-free YOLO heads, decoded teacher, student, and GT boxes use **image-normalized xyxy** coordinates clipped
+to `[0, 1]`. The anchor-relative offset ranges in the paper's table are not applied to pixel coordinates. This is an
+adaptation to the native YOLO output interface, rather than a reproduction of the paper's training results.
+One-class detection uses an auxiliary binary background/foreground distribution, so class KD remains meaningful.
+
+BTKD++ currently supports **detect only**. Teacher and student must have identical class names/order, feature strides,
+spatial grids, and prediction branches, with unfused detection heads. Internal channel widths may differ. YOLO26
+distills both branches using the native one-to-many/one-to-one weights and retains the existing backbone detach.
+Its `reg_max=1` head is unchanged: Gaussian bins exist only inside the additional loss.
+
+The full BTKD++ loss runs in FP32 under `amp=True`; model forwards retain the trainer's AMP setting. Empty positive,
+easy, or hard sets produce a differentiable zero contribution. No feature projectors or trainable KD layers are added.
+The native supervised loss remains unchanged, and `distill_model=None` retains ordinary training. Resume recomputes
+the curriculum from the resumed epoch and total training budget. Final stripped checkpoints retain only the student.
+
+```python
+from ultralytics import YOLO
+
+student = YOLO("yolo26n.pt")
+student.train(
+    data="dataset.yaml",
+    distill_model="teacher_yolo26s.pt",  # teacher trained on the same classes, in the same order
+    distill_method="btkd",
+    dis=1.0,  # example starting weight; select on validation data, independently of CanKD's weight
+    amp=True,
+)
+```
+
+For structured-pruning recovery, keep the custom trainer that loads the actual pruned module instead of reconstructing
+it from YAML, and keep its custom pruning classes importable in DDP workers. The BTKD++ wrapper preserves that student
+object. CanKD-specific notebook checks for projector gradients must be adapted, since BTKD++ has no projectors.
+
 ## Task Support
 
-The distillation implementation extracts features from the three neck layers that feed the model's Detect-family head. Because the **segment**, **pose**, and **obb** heads inherit from the same `Detect` architecture, distillation is technically compatible with those tasks as well.
+The `sl2` and `cankd` implementations extract features from the three neck layers that feed the model's Detect-family head. Because the **segment**, **pose**, and **obb** heads inherit from the same `Detect` architecture, these two methods are technically compatible with those tasks as well. The `btkd` method supports **detect only**.
 
 Classification, semantic segmentation, depth estimation, and RT-DETR do not use a compatible Detect-family head and are not supported.
 

@@ -492,6 +492,9 @@ class BaseTrainer:
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
         while True:
             self.epoch = epoch
+            model = unwrap_model(self.model)
+            if isinstance(model, DistillationModel) and model.distill_method == "btkd":
+                model.btkd.gamma = (epoch + 1) / self.epochs
             self.run_callbacks("on_train_epoch_start")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'

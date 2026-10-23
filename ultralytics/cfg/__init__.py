@@ -534,8 +534,8 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                 else:
                     cfg[k] = scheme
 
-    if "distill_method" in cfg and cfg["distill_method"] not in {"sl2", "cankd"}:
-        raise ValueError("'distill_method' must be 'sl2' or 'cankd'.")
+    if "distill_method" in cfg and cfg["distill_method"] not in {"sl2", "cankd", "btkd"}:
+        raise ValueError("'distill_method' must be 'sl2', 'cankd', or 'btkd'.")
 
 
 def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:

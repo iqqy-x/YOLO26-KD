@@ -2,6 +2,7 @@
 
 import sys
 from collections import OrderedDict
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -15,7 +16,7 @@ from ultralytics.cfg import get_cfg
 from ultralytics.engine.exporter import Exporter
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models.yolo import classify, depth, detect, obb, pose, segment, semantic
-from ultralytics.nn.distill_model import DistillationModel
+from ultralytics.nn.distill_model import BTKDLoss, DistillationModel
 from ultralytics.nn.tasks import DetectionModel, load_checkpoint
 from ultralytics.utils import ASSETS, DEFAULT_CFG, IS_RASPBERRYPI, WEIGHTS_DIR
 from ultralytics.utils.torch_utils import unwrap_model
@@ -186,7 +187,7 @@ def test_resume_invalid_checkpoint_args(tmp_path):
         detect.DetectionTrainer(overrides={"model": MODEL, "data": "coco8.yaml", "resume": str(last)})
 
 
-@pytest.mark.parametrize("distill_method", ("sl2", "cankd"))
+@pytest.mark.parametrize("distill_method", ("sl2", "cankd", "btkd"))
 def test_distill_resume(tmp_path: Path, distill_method: str):
     """Test knowledge distillation resumes from an incomplete checkpoint."""
     overrides = {
@@ -240,6 +241,54 @@ def test_distill_resume(tmp_path: Path, distill_method: str):
     assert isinstance(model, DistillationModel), "resume should rebuild the DistillationModel"
     assert model.teacher_model is not None, "resume should rebuild the teacher from the distill_model path"
     assert trainer.start_epoch == trainer.epoch == 1, "resume test failed"
+
+
+def test_btkd_rectification():
+    """Preserve probability mass and unaffected classes, including already-correct predictions."""
+    prob = torch.tensor([[0.1, 0.6, 0.2, 0.1], [0.7, 0.1, 0.1, 0.1]])
+    rectified = BTKDLoss.rectify(prob, torch.tensor([0, 0]))
+    torch.testing.assert_close(rectified.sum(-1), prob.sum(-1))
+    torch.testing.assert_close(rectified[0, :2], torch.tensor([1.1 * 0.7 / 1.7, 0.6 * 0.7 / 1.7]))
+    torch.testing.assert_close(rectified[0, 2:], prob[0, 2:], rtol=0, atol=0)
+    torch.testing.assert_close(rectified[1], prob[1], rtol=0, atol=0)
+    torch.testing.assert_close(prob[0], torch.tensor([0.1, 0.6, 0.2, 0.1]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cfg,nc", (("yolo26n.yaml", 4), ("yolov8n.yaml", 4), ("yolo26n.yaml", 1)))
+def test_btkd_detection(cfg, nc):
+    """Preserve native detection loss while KD alone trains class/box heads and handles empty labels."""
+    imgsz = 128 if cfg == "yolov8n.yaml" else 64
+    student = DetectionModel(cfg, nc=nc, verbose=False)
+    student.args = get_cfg(overrides={"imgsz": imgsz, "distill_method": "btkd", "dis": 1.0})
+    native = deepcopy(student)
+    shapes = {name: tuple(p.shape) for name, p in student.named_parameters()}
+    model = DistillationModel(deepcopy(student), student)
+    model.btkd.gamma = 0.5
+    batch = {
+        "img": torch.rand(2, 3, imgsz, imgsz),
+        "batch_idx": torch.tensor([0.0, 1.0]),
+        "cls": torch.zeros(2, 1),
+        "bboxes": torch.tensor([[0.5, 0.5, 0.5, 0.5], [0.4, 0.6, 0.3, 0.4]]),
+    }
+    native_loss, _ = native(batch)
+    loss, _ = model(batch)
+    torch.testing.assert_close(loss[:-1], native_loss, rtol=0, atol=0)
+    assert len(model.projector) == 0
+    assert shapes == {name: tuple(p.shape) for name, p in student.named_parameters()}
+    assert torch.isfinite(loss).all() and loss[-1] > 0
+    loss[-1].backward()
+    head = student.model[-1]
+    for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
+        branch = getattr(head, name, None)
+        if branch is not None:
+            assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in branch.parameters()), name
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in student.parameters())
+    assert all(not p.requires_grad and p.grad is None for p in model.teacher_model.parameters())
+    model.zero_grad(set_to_none=True)
+    batch.update(batch_idx=torch.empty(0), cls=torch.empty(0, 1), bboxes=torch.empty(0, 4))
+    loss, _ = model(batch)
+    assert torch.isfinite(loss).all() and loss[-1] == 0
+    loss[-1].backward()
 
 
 def test_distill_grayscale(tmp_path: Path):

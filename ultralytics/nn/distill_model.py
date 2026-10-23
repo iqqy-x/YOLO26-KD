@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from ultralytics.nn.modules.head import Detect
+from ultralytics.utils.metrics import bbox_iou
+from ultralytics.utils.tal import dist2bbox, make_anchors
 from ultralytics.utils.torch_utils import autocast, copy_attr
 
 from .tasks import load_checkpoint
@@ -143,6 +146,107 @@ class CanKDLoss(nn.Module):
         return loss * self.loss_weight
 
 
+class BTKDLoss(nn.Module):
+    """BTKD++ detection distillation with probability rectification and Gaussian box distributions.
+
+    Follows Sections 3.3-4.1 and Appendix A of https://doi.org/10.1007/s11263-026-02924-x. Anchor-free
+    boxes use image-normalized xyxy coordinates in [0, 1], rather than anchor-relative offset ranges.
+    """
+
+    def __init__(self):
+        """Use temperature 2, IoU threshold 0.65, 128 bins, and a Gaussian width of two bins."""
+        super().__init__()
+        self.temperature = 2.0
+        self.iou_threshold = 0.65
+        self.gamma = 0.0
+        self.register_buffer("centers", (torch.arange(128, dtype=torch.float32) + 0.5) / 128)
+
+    @staticmethod
+    def rectify(prob: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Rectify the wrong/GT probability pair while preserving its mass and all other entries."""
+        wrong = prob.argmax(-1, keepdim=True)
+        labels = labels.unsqueeze(-1)
+        p_gt, p_wrong = prob.gather(-1, labels), prob.gather(-1, wrong)
+        mass = p_gt + p_wrong
+        scale = mass / (1 + mass)
+        rectified = prob.clone()
+        rectified.scatter_(-1, labels, torch.where(wrong != labels, (p_gt + 1) * scale, p_gt))
+        rectified.scatter_(-1, wrong, torch.where(wrong != labels, p_wrong * scale, p_wrong))
+        return rectified
+
+    def distill(
+        self, student_log: torch.Tensor, teacher_prob: torch.Tensor, labels: torch.Tensor, easy: torch.Tensor
+    ) -> torch.Tensor:
+        """Return separately normalized easy/hard KL losses with the linear curriculum weights."""
+        target = torch.where(easy.unsqueeze(-1), teacher_prob, self.rectify(teacher_prob, labels))
+        kl = F.kl_div(student_log, target, reduction="none").sum(-1)
+        hard = ~easy
+        return (1 - self.gamma) * (kl * easy).sum() / easy.sum().clamp(min=1) + self.gamma * (
+            kl * hard
+        ).sum() / hard.sum().clamp(min=1)
+
+    @staticmethod
+    def decode(preds: dict, head: Detect, foreground: torch.Tensor) -> torch.Tensor:
+        """Decode only assigned positive boxes to pixel xyxy, retaining student coordinate gradients."""
+        anchors, strides = make_anchors(preds["feats"], head.stride, 0.5)
+        batch_size = foreground.shape[0]
+        anchors = anchors.unsqueeze(0).expand(batch_size, -1, -1)[foreground].float()
+        strides = strides.unsqueeze(0).expand(batch_size, -1, -1)[foreground].float()
+        distances = preds["boxes"].permute(0, 2, 1)[foreground].float()
+        if head.reg_max > 1:
+            distances = (
+                distances.reshape(-1, 4, head.reg_max)
+                .softmax(-1)
+                .matmul(torch.arange(head.reg_max, device=distances.device, dtype=torch.float32))
+            )
+        return dist2bbox(distances, anchors, xywh=False) * strides
+
+    def forward(
+        self,
+        student: dict,
+        teacher: dict,
+        assigned: tuple,
+        student_head: Detect,
+        teacher_head: Detect,
+        image_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        """Distill class and four coordinate distributions at the native assignment's positive grid positions."""
+        if [f.shape[-2:] for f in student["feats"]] != [f.shape[-2:] for f in teacher["feats"]]:
+            raise ValueError("BTKD++ requires matching teacher/student feature grids")
+        foreground = assigned[3].bool()
+        labels, gt_boxes = assigned[0][foreground].long(), assigned[1][foreground].float()
+        s_scores = student["scores"].permute(0, 2, 1)[foreground].float()
+        t_scores = teacher["scores"].detach().permute(0, 2, 1)[foreground].float()
+        s_boxes = self.decode(student, student_head, foreground)
+        if student_head.nc == 1:
+            # A binary background/foreground distribution avoids a degenerate one-class softmax.
+            s_scores = torch.cat((torch.zeros_like(s_scores), s_scores), -1)
+        with torch.no_grad():
+            t_boxes = self.decode(teacher, teacher_head, foreground)
+            if student_head.nc == 1:
+                t_scores = torch.cat((torch.zeros_like(t_scores), t_scores), -1)
+                labels = torch.ones_like(labels)
+            easy = (t_scores.argmax(-1) == labels) & (
+                bbox_iou(t_boxes, gt_boxes, xywh=False).squeeze(-1) >= self.iou_threshold
+            )
+        cls_loss = self.distill(
+            (s_scores / self.temperature).log_softmax(-1),
+            (t_scores / self.temperature).softmax(-1),
+            labels,
+            easy,
+        )
+        height, width = image_shape
+        scale = s_boxes.new_tensor((width, height, width, height))
+        s_boxes, t_boxes, gt_boxes = ((boxes / scale).clamp(0, 1) for boxes in (s_boxes, t_boxes, gt_boxes))
+        # The paper specifies sigma in bins, not in image-normalized coordinate units.
+        s_log = (-0.5 * ((s_boxes.unsqueeze(-1) - self.centers.float()) / (2 / 128)).square()).log_softmax(-1)
+        t_prob = (-0.5 * ((t_boxes.unsqueeze(-1) - self.centers.float()) / (2 / 128)).square()).softmax(-1)
+        gt_bins = (gt_boxes * 128).long().clamp(max=127)
+        # Treat the four coordinates independently, summing their mean distillation losses.
+        box_loss = self.distill(s_log, t_prob, gt_bins, easy.unsqueeze(-1).expand_as(gt_bins)) * 4
+        return cls_loss + box_loss
+
+
 class FeatureHook:
     """Picklable forward hook that stores layer output into a shared dict."""
 
@@ -171,7 +275,7 @@ class DistillationModel(nn.Module):
         feats_idx (list): Student layer indices for feature extraction.
         teacher_feats_idx (list): Teacher layer indices at the same feature levels.
         projector (nn.ModuleList): Per-level MLP projectors, or CanKD channel aligners and losses.
-        distill_method (str): Distillation method, either "sl2" or "cankd".
+        distill_method (str): Distillation method: "sl2", "cankd", or "btkd" (BTKD++ detection).
         dis (float): Distillation loss weight factor.
 
     Methods:
@@ -210,6 +314,9 @@ class DistillationModel(nn.Module):
         self.teacher_model = teacher_model.to(device)
         self._freeze_teacher()
         self.student_model = student_model
+        self.distill_method = getattr(student_model.args, "distill_method", "sl2")
+        if self.distill_method not in {"sl2", "cankd", "btkd"}:
+            raise ValueError("distill_method must be 'sl2', 'cankd', or 'btkd'")
         self.feats_idx = self.get_distill_layers(student_model)
         self.teacher_feats_idx = self.get_distill_layers(teacher_model)
         if len(self.feats_idx) != len(self.teacher_feats_idx):
@@ -220,6 +327,26 @@ class DistillationModel(nn.Module):
         self._student_feats: dict[int, torch.Tensor] = {}
         self._teacher_hooks: list = []
         self._student_hooks: list = []
+        if self.distill_method == "btkd":
+            student_head, teacher_head = student_model.model[-1], teacher_model.model[-1]
+            if type(student_head) is not Detect or type(teacher_head) is not Detect:
+                raise ValueError("BTKD++ currently supports object detection with Detect heads only")
+            if student_head.nc != teacher_head.nc or student_model.names != teacher_model.names:
+                raise ValueError("BTKD++ requires identical teacher/student classes and class order")
+            if not torch.equal(student_head.stride, teacher_head.stride):
+                raise ValueError("BTKD++ requires matching teacher/student detection strides")
+            dual_head = getattr(student_head, "one2one_cv2", None) is not None
+            if dual_head != (getattr(teacher_head, "one2one_cv2", None) is not None):
+                raise ValueError("BTKD++ requires matching teacher/student prediction branches")
+            heads = ("cv2", "cv3", "one2one_cv2", "one2one_cv3") if dual_head else ("cv2", "cv3")
+            if any(getattr(head, name, None) is None for head in (student_head, teacher_head) for name in heads):
+                raise ValueError("BTKD++ requires unfused teacher/student detection heads")
+            copy_attr(self, student_model)
+            self.dis = student_model.args.dis
+            # Keep the existing checkpoint/resume contract without trainable KD layers.
+            self.projector = nn.ModuleList()
+            self.btkd = BTKDLoss().to(device)
+            return
         self._register_feature_hooks()
 
         # Get feature dimensions via dummy forward pass (hooks capture outputs)
@@ -235,9 +362,6 @@ class DistillationModel(nn.Module):
 
         copy_attr(self, student_model)
         self.dis = self.student_model.args.dis
-        self.distill_method = getattr(self.student_model.args, "distill_method", "sl2")
-        if self.distill_method not in {"sl2", "cankd"}:
-            raise ValueError("distill_method must be 'sl2' or 'cankd'")
         projectors = []
         for student_out, teacher_out in zip(student_output[:-1], teacher_output[:-1]):
             student_dim = self.decouple_outputs(student_out).shape[1]
@@ -283,6 +407,7 @@ class DistillationModel(nn.Module):
     def __setstate__(self, state):
         """Clear stale features and hooks, and re-register forward hooks after unpickling."""
         state.setdefault("teacher_feats_idx", state["feats_idx"])  # checkpoints saved before teacher_feats_idx
+        state.setdefault("distill_method", "sl2")
         self.__dict__.update(state)
         self._teacher_feats = {}
         self._student_feats = {}
@@ -308,6 +433,8 @@ class DistillationModel(nn.Module):
     def _register_feature_hooks(self) -> None:
         """Register feature-capture hooks, removing stale FeatureHook instances first."""
         self._remove_feature_hooks()
+        if self.distill_method == "btkd":
+            return
         for i, (s, t) in enumerate(zip(self.feats_idx, self.teacher_feats_idx)):  # features stored by level i
             self._clear_feature_hooks(self.student_model.model[s])
             self._student_hooks.append(
@@ -407,8 +534,11 @@ class DistillationModel(nn.Module):
         self._student_feats.clear()
 
         with torch.no_grad():
-            self.teacher_model(batch["img"])  # hooks capture teacher features
+            teacher_preds = self.teacher_model(batch["img"])  # hooks capture teacher features for feature KD
         preds = self.student_model(batch["img"])  # hooks capture student features
+
+        if self.distill_method == "btkd":
+            return self.loss_btkd(batch, preds, teacher_preds)
 
         regular_loss, loss_items = self.student_model.loss(batch, preds)
         n = len(self.feats_idx) - 1  # neck levels; level n is the Detect head
@@ -439,6 +569,40 @@ class DistillationModel(nn.Module):
         loss_items["dis_loss"] = loss_distill.detach()
         loss_distill = loss_distill * batch["img"].shape[0]
         return torch.cat([regular_loss, loss_distill]), loss_items
+
+    def loss_btkd(self, batch: dict, preds: dict, teacher_preds: dict | tuple) -> tuple:
+        """Observe native assignments once per head and add BTKD++ without modifying the native criterion."""
+        if getattr(self.student_model, "criterion", None) is None:
+            self.student_model.criterion = self.student_model.init_criterion()
+        criterion = self.student_model.criterion
+        branches = (
+            (("one2many", criterion.one2many, criterion.o2m), ("one2one", criterion.one2one, criterion.o2o))
+            if "one2many" in preds
+            else ((None, criterion, 1.0),)
+        )
+        assigned = {}
+        with ExitStack() as hooks:
+            for i, (_, branch_loss, _) in enumerate(branches):
+                hooks.callback(branch_loss.assigner.register_forward_hook(FeatureHook(assigned, i)).remove)
+            regular_loss, loss_items = self.student_model.loss(batch, preds)
+        teacher_preds = teacher_preds[1] if isinstance(teacher_preds, tuple) else teacher_preds
+        loss_distill = regular_loss.new_zeros(1)
+        with autocast(enabled=False, device=batch["img"].device.type):
+            for i, (branch, _, weight) in enumerate(branches):
+                loss_distill += (
+                    weight
+                    * self.dis
+                    * self.btkd(
+                        preds[branch] if branch else preds,
+                        teacher_preds[branch] if branch else teacher_preds,
+                        assigned[i],
+                        self.student_model.model[-1],
+                        self.teacher_model.model[-1],
+                        batch["img"].shape[-2:],
+                    )
+                )
+        loss_items["dis_loss"] = loss_distill.detach()
+        return torch.cat((regular_loss, loss_distill * batch["img"].shape[0])), loss_items
 
     def loss_sl2(
         self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, feat_idx: int, teacher_scores: tuple

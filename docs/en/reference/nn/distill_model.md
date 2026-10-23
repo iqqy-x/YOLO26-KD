@@ -24,6 +24,10 @@ keywords: Ultralytics, ultralytics.nn.distill_model, API reference, YOLO, Python
 
 <br><br><hr><br>
 
+## ::: ultralytics.nn.distill_model.BTKDLoss
+
+<br><br><hr><br>
+
 ## ::: ultralytics.nn.distill_model.FeatureHook
 
 <br><br><hr><br>
