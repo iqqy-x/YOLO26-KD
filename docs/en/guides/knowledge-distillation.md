@@ -81,11 +81,12 @@ Cross-family distillation (e.g., YOLO11 teacher with YOLO26 student) is **not su
 
 ## Key Parameters
 
-| Parameter        | Type    | Default | Description                                                                                                             |
-| ---------------- | ------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `distill_model`  | `str`   | `None`  | Path to the teacher model file (e.g., `yolo26x.pt`). Setting this enables knowledge distillation.                       |
-| `distill_method` | `str`   | `'sl2'` | Loss method: score-weighted L2 (`sl2`), cross-attention non-local distillation (`cankd`), or BTKD++ detection (`btkd`). |
-| `dis`            | `float` | `6.0`   | Distillation loss weight. CanKD applies this once to `mean MSE / 2`; use `10.0` for the official detection setting.     |
+| Parameter         | Type    | Default | Description                                                                                                         |
+| ----------------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| `distill_model`   | `str`   | `None`  | Path to the teacher model file (e.g., `yolo26x.pt`). Setting this enables knowledge distillation.                   |
+| `distill_method`  | `str`   | `'sl2'` | Loss method: score-weighted L2 (`sl2`), cross-attention KD (`cankd`), channel-wise KL (`cwd`), or BTKD++ (`btkd`).  |
+| `dis`             | `float` | `6.0`   | Distillation loss weight. CanKD applies this once to `mean MSE / 2`; use `10.0` for the official detection setting. |
+| `cwd_temperature` | `float` | `1.0`   | Positive, finite spatial softmax temperature for CWD. Saved with the training arguments for resume.                 |
 
 ## How It Works
 
@@ -153,6 +154,55 @@ For a built-in KD comparison, use `distill_method="sl2"`. Keep the teacher check
 splits, and training settings consistent, and select loss weights on the validation split. This ports the CanKD method to
 YOLO; it does not reproduce the paper's OpenMMLab detector experiments or the additional CanKD† weight-inheritance setting.
 
+### Channel-wise Distillation (CWD)
+
+Set `distill_method="cwd"` to use Equation (4) of
+[Channel-wise Knowledge Distillation for Dense Prediction](https://arxiv.org/abs/2011.13256). For each neck feature level:
+
+1. A **1×1 convolution**, without activation or normalization, aligns student channels to teacher channels when needed.
+   Equal channel counts use an identity mapping. The aligner uses PyTorch's default convolution initialization, as in the
+   [reference detection loss](https://github.com/pppppM/mmdetection-distiller/blob/master/mmdet/distillation/losses/cwd.py).
+2. Each aligned student and detached teacher channel is normalized over all **H×W spatial positions**, using temperature
+   `cwd_temperature`. Student log probabilities use `log_softmax` for numerical stability.
+3. **KL(teacher || student)** is summed over positions and channels, divided by **N×C**, and multiplied by **temperature²**
+   and `dis` exactly once. Here C is the **aligned** channel count. Level losses are summed and batch-scaled like native KD.
+
+This implements the paper's full KL and matches TorchDistiller's `CriterionCWD` with channel normalization and KL
+divergence. The reference detection loss omits teacher entropy, giving the same student gradients when the teacher is
+fixed and normalization is identical. For unequal channels, this implementation normalizes after alignment, following the
+paper, rather than using the reference detection code's pre-alignment channel count.
+
+CWD currently supports **detect only**, with matching teacher/student feature strides and spatial grids. YOLO26 uses its
+existing P3–P5 neck outputs. The original features still feed both detection branches with the native one-to-one detach;
+supervised loss and assignment are unchanged. CWD uses all spatial positions, including background, and remains active on
+images without labels. A single spatial position or identical distributions can correctly produce zero loss.
+
+Alignment and CWD run in FP32 under `amp=True`; model forwards retain AMP. Aligners are optimized, included in EMA, and
+restored on resume. Final stripped checkpoints contain only the student. For structured-pruning recovery, retain the
+custom trainer that loads the actual pruned module and its importable custom classes. Each level may have no trainable
+KD parameters when its alignment is an identity.
+
+The default temperature **1.0** follows the
+[reference RetinaNet configuration](https://github.com/pppppM/mmdetection-distiller/blob/master/configs/distillers/cwd/cwd_retina_rx101_64x4d_distill_retina_r50_fpn_2x_coco.py),
+which uses weight **5.0**. The paper's segmentation settings use temperature **4**, with logits/feature weights **3/50**.
+The global `dis` default remains **6.0** for all methods; select and record the CWD weight explicitly. These settings are
+starting references, not validated YOLO26 recovery optima. Using three YOLO feature levels adapts the method and does not
+reproduce the paper's detector experiments.
+
+```python
+from ultralytics import YOLO
+
+student = YOLO("yolo26n.pt")
+student.train(
+    data="dataset.yaml",
+    distill_model="teacher_yolo26s.pt",
+    distill_method="cwd",
+    dis=5.0,  # reference detection weight; validate for the chosen teacher/student and dataset
+    cwd_temperature=1.0,
+    amp=True,
+)
+```
+
 ### BTKD++ for Object Detection
 
 Set `distill_method="btkd"` to use the object detection extension of
@@ -204,7 +254,7 @@ object. CanKD-specific notebook checks for projector gradients must be adapted, 
 
 ## Task Support
 
-The `sl2` and `cankd` implementations extract features from the three neck layers that feed the model's Detect-family head. Because the **segment**, **pose**, and **obb** heads inherit from the same `Detect` architecture, these two methods are technically compatible with those tasks as well. The `btkd` method supports **detect only**.
+The `sl2` and `cankd` implementations extract features from the three neck layers that feed the model's Detect-family head. Because the **segment**, **pose**, and **obb** heads inherit from the same `Detect` architecture, these two methods are technically compatible with those tasks as well. The `cwd` and `btkd` methods support **detect only**.
 
 Classification, semantic segmentation, depth estimation, and RT-DETR do not use a compatible Detect-family head and are not supported.
 

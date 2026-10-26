@@ -89,8 +89,9 @@ Ultralytics YOLO models operate in different modes, each designed for a specific
 
 ## Train Settings
 
-Knowledge distillation is enabled by `distill_model`. Select `distill_method=sl2` (default), `cankd`, or `btkd`
-(BTKD++ for detection only), and set its weight with `dis`. See [Knowledge Distillation](../guides/knowledge-distillation.md)
+Knowledge distillation is enabled by `distill_model`. Select `distill_method=sl2` (default), `cankd`, `cwd`, or `btkd`
+(CWD and BTKD++ support detection only), and set its weight with `dis`. CWD uses the positive, finite
+`cwd_temperature` argument (default `1.0`) for its spatial softmax. See [Knowledge Distillation](../guides/knowledge-distillation.md)
 for method requirements, AMP behavior, and structured-pruning recovery considerations.
 
 Training settings for YOLO models include hyperparameters and configurations that affect the model's performance, speed, and [accuracy](https://www.ultralytics.com/glossary/accuracy). Key settings include [batch size](https://www.ultralytics.com/glossary/batch-size), [learning rate](https://www.ultralytics.com/glossary/learning-rate), momentum, and weight decay. The choice of optimizer, [loss function](https://www.ultralytics.com/glossary/loss-function), and dataset composition also impact training. Tuning and experimentation are crucial for optimal performance. For more details, see the [Ultralytics entrypoint function](../reference/cfg/__init__.md).

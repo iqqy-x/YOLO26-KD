@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from math import isfinite
 from pathlib import Path
 
 import torch
@@ -146,6 +147,36 @@ class CanKDLoss(nn.Module):
         return loss * self.loss_weight
 
 
+class CWDLoss(nn.Module):
+    """Channel-wise KL distillation, following Equation (4) of https://arxiv.org/abs/2011.13256.
+
+    Each channel defines a distribution over spatial positions. Alignment is external, and normalization uses the
+    aligned channel count, as in TorchDistiller's CriterionCWD with norm_type="channel" and divergence="kl".
+
+    Attributes:
+        temperature (float): Positive softmax temperature.
+        loss_weight (float): Multiplier applied once to the channel-averaged KL loss.
+    """
+
+    def __init__(self, temperature: float = 1.0, loss_weight: float = 1.0):
+        """Initialize the spatial softmax temperature and distillation weight."""
+        super().__init__()
+        if not isfinite(temperature) or temperature <= 0:
+            raise ValueError("cwd_temperature must be finite and greater than 0")
+        self.temperature = temperature
+        self.loss_weight = loss_weight
+
+    def forward(self, s_feature: torch.Tensor, t_feature: torch.Tensor) -> torch.Tensor:
+        """Return weighted KL(teacher || student), summed spatially and averaged over samples and aligned channels."""
+        if s_feature.ndim != 4 or s_feature.shape != t_feature.shape:
+            raise ValueError("CWD requires aligned student/teacher features with matching (N, C, H, W) shapes")
+        n, c = s_feature.shape[:2]
+        student_log = (s_feature.float().flatten(2) / self.temperature).log_softmax(-1)
+        teacher_prob = (t_feature.detach().float().flatten(2) / self.temperature).softmax(-1)
+        loss = F.kl_div(student_log, teacher_prob, reduction="sum")
+        return loss * (self.temperature**2) * self.loss_weight / (n * c)
+
+
 class BTKDLoss(nn.Module):
     """BTKD++ detection distillation with probability rectification and Gaussian box distributions.
 
@@ -274,8 +305,8 @@ class DistillationModel(nn.Module):
         student_model (nn.Module): Trainable student model being distilled.
         feats_idx (list): Student layer indices for feature extraction.
         teacher_feats_idx (list): Teacher layer indices at the same feature levels.
-        projector (nn.ModuleList): Per-level MLP projectors, or CanKD channel aligners and losses.
-        distill_method (str): Distillation method: "sl2", "cankd", or "btkd" (BTKD++ detection).
+        projector (nn.ModuleList): Per-level MLP projectors, or CanKD/CWD channel aligners and losses.
+        distill_method (str): Distillation method: "sl2", "cankd", "cwd", or "btkd" (BTKD++ detection).
         dis (float): Distillation loss weight factor.
 
     Methods:
@@ -315,8 +346,8 @@ class DistillationModel(nn.Module):
         self._freeze_teacher()
         self.student_model = student_model
         self.distill_method = getattr(student_model.args, "distill_method", "sl2")
-        if self.distill_method not in {"sl2", "cankd", "btkd"}:
-            raise ValueError("distill_method must be 'sl2', 'cankd', or 'btkd'")
+        if self.distill_method not in {"sl2", "cankd", "cwd", "btkd"}:
+            raise ValueError("distill_method must be 'sl2', 'cankd', 'cwd', or 'btkd'")
         self.feats_idx = self.get_distill_layers(student_model)
         self.teacher_feats_idx = self.get_distill_layers(teacher_model)
         if len(self.feats_idx) != len(self.teacher_feats_idx):
@@ -347,6 +378,11 @@ class DistillationModel(nn.Module):
             self.projector = nn.ModuleList()
             self.btkd = BTKDLoss().to(device)
             return
+        if self.distill_method == "cwd":
+            if type(student_model.model[-1]) is not Detect or type(teacher_model.model[-1]) is not Detect:
+                raise ValueError("CWD currently supports object detection with Detect heads only")
+            if not torch.equal(student_model.model[-1].stride, teacher_model.model[-1].stride):
+                raise ValueError("CWD requires matching teacher/student feature strides")
         self._register_feature_hooks()
 
         # Get feature dimensions via dummy forward pass (hooks capture outputs)
@@ -366,9 +402,9 @@ class DistillationModel(nn.Module):
         for student_out, teacher_out in zip(student_output[:-1], teacher_output[:-1]):
             student_dim = self.decouple_outputs(student_out).shape[1]
             teacher_dim = self.decouple_outputs(teacher_out).shape[1]
-            if self.distill_method == "cankd":
+            if self.distill_method in {"cankd", "cwd"}:
                 align = nn.Conv2d(student_dim, teacher_dim, 1) if student_dim != teacher_dim else nn.Identity()
-                if isinstance(align, nn.Conv2d):
+                if self.distill_method == "cankd" and isinstance(align, nn.Conv2d):
                     # Match the official ConvModuleConnector with norm_cfg=None and act_cfg=None.
                     nn.init.kaiming_normal_(align.weight, a=0, mode="fan_out", nonlinearity="relu")
                     nn.init.constant_(align.bias, 0)
@@ -376,7 +412,9 @@ class DistillationModel(nn.Module):
                     nn.ModuleDict(
                         {
                             "align": align,
-                            "loss": CanKDLoss(in_channels=teacher_dim, loss_weight=self.dis),
+                            "loss": CanKDLoss(in_channels=teacher_dim, loss_weight=self.dis)
+                            if self.distill_method == "cankd"
+                            else CWDLoss(temperature=student_model.args.cwd_temperature, loss_weight=self.dis),
                         }
                     )
                 )
@@ -555,9 +593,9 @@ class DistillationModel(nn.Module):
         for i in range(n):
             teacher_feat = self.decouple_outputs(self._teacher_feats[i])
             student_feat = self.decouple_outputs(self._student_feats[i])
-            if self.distill_method == "cankd":
+            if self.distill_method in {"cankd", "cwd"}:
                 level = self.projector[i]
-                # Keep alignment and unnormalized attention products in FP32 under AMP.
+                # Keep alignment and feature distillation losses in FP32 under AMP.
                 with autocast(enabled=False, device=student_feat.device.type):
                     loss_distill += level["loss"](level["align"](student_feat.float()), teacher_feat.float())
             else:

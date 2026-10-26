@@ -99,8 +99,9 @@ warmup_epochs: 3.0 # (float) warmup epochs (fractions allowed)
 warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 distill_model: # (str, optional) path to teacher model for knowledge distillation
-distill_method: sl2 # (str) distillation loss: sl2 (score-weighted L2), cankd (cross-attention), or btkd (BTKD++ detection)
+distill_method: sl2 # (str) distillation loss: sl2 (score-weighted L2), cankd (cross-attention), cwd (channel-wise KL), or btkd
 dis: 6.0 # (float) distillation loss weight; CanKD uses dis * mean MSE / 2 (set 10.0 for the paper's detection weight)
+cwd_temperature: 1.0 # (float) positive spatial softmax temperature for CWD; 1.0 follows the reference detection config
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
 cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disable, 1.0=full inverse frequency)

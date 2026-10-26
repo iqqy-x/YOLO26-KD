@@ -3,6 +3,7 @@
 import sys
 from collections import OrderedDict
 from copy import deepcopy
+from math import log
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -16,7 +17,7 @@ from ultralytics.cfg import get_cfg
 from ultralytics.engine.exporter import Exporter
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models.yolo import classify, depth, detect, obb, pose, segment, semantic
-from ultralytics.nn.distill_model import BTKDLoss, DistillationModel
+from ultralytics.nn.distill_model import BTKDLoss, CWDLoss, DistillationModel
 from ultralytics.nn.tasks import DetectionModel, load_checkpoint
 from ultralytics.utils import ASSETS, DEFAULT_CFG, IS_RASPBERRYPI, WEIGHTS_DIR
 from ultralytics.utils.torch_utils import unwrap_model
@@ -187,7 +188,7 @@ def test_resume_invalid_checkpoint_args(tmp_path):
         detect.DetectionTrainer(overrides={"model": MODEL, "data": "coco8.yaml", "resume": str(last)})
 
 
-@pytest.mark.parametrize("distill_method", ("sl2", "cankd", "btkd"))
+@pytest.mark.parametrize("distill_method", ("sl2", "cankd", "cwd", "btkd"))
 def test_distill_resume(tmp_path: Path, distill_method: str):
     """Test knowledge distillation resumes from an incomplete checkpoint."""
     overrides = {
@@ -196,6 +197,7 @@ def test_distill_resume(tmp_path: Path, distill_method: str):
         "distill_model": WEIGHTS_DIR / "yolo26s.pt",
         "distill_method": distill_method,
         "dis": 10.0 if distill_method == "cankd" else 6.0,
+        "cwd_temperature": 2.5,
         "imgsz": 128 if distill_method == "cankd" else 32,
         "multi_scale": 0.5,  # vary per-batch image size to exercise dynamic distillation score splitting
         "epochs": 2,
@@ -232,6 +234,8 @@ def test_distill_resume(tmp_path: Path, distill_method: str):
     def check_restored_modules(trainer):
         restored = unwrap_model(trainer.model)
         assert restored.distill_method == distill_method
+        if distill_method == "cwd":
+            assert all(level["loss"].temperature == 2.5 for level in restored.projector)
         for key, value in restored.projector.state_dict().items():
             torch.testing.assert_close(value.float(), projector_state[key], rtol=0, atol=0)
 
@@ -241,6 +245,32 @@ def test_distill_resume(tmp_path: Path, distill_method: str):
     assert isinstance(model, DistillationModel), "resume should rebuild the DistillationModel"
     assert model.teacher_model is not None, "resume should rebuild the teacher from the distill_model path"
     assert trainer.start_epoch == trainer.epoch == 1, "resume test failed"
+
+
+@pytest.mark.parametrize("temperature", (1.0, 4.0))
+def test_cwd_loss(temperature):
+    """Check the analytic channel KL and gradient, teacher detachment, and stable extreme logits."""
+    p = torch.tensor([[[[0.6, 0.3, 0.1]], [[0.2, 0.2, 0.6]]]])
+    q = torch.tensor([[[[0.1, 0.7, 0.2]], [[0.5, 0.25, 0.25]]]])
+    student = (p.log() * temperature).requires_grad_()
+    teacher = (q.log() * temperature).requires_grad_()
+    loss = CWDLoss(temperature, loss_weight=2.5)(student, teacher)
+    expected = sum(b * log(b / a) for a, b in zip(p.flatten().tolist(), q.flatten().tolist()))
+    assert loss.item() == pytest.approx(expected * 2.5 * temperature**2 / 2, rel=2e-6)
+    loss.backward()
+    torch.testing.assert_close(student.grad, (p - q) * (2.5 * temperature / 2))
+    assert teacher.grad is None
+    extreme = torch.tensor([[[[-1000.0, 0.0, 1000.0]]]], requires_grad=True)
+    loss = CWDLoss(temperature)(extreme, torch.zeros_like(extreme))
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(extreme.grad).all()
+
+
+@pytest.mark.parametrize("temperature", (0.0, -1.0, float("inf"), float("nan")))
+def test_cwd_temperature(temperature):
+    """Reject undefined spatial softmax temperatures."""
+    with pytest.raises(ValueError, match="cwd_temperature"):
+        CWDLoss(temperature)
 
 
 def test_btkd_rectification():
@@ -255,15 +285,22 @@ def test_btkd_rectification():
 
 
 @pytest.mark.parametrize("cfg,nc", (("yolo26n.yaml", 4), ("yolov8n.yaml", 4), ("yolo26n.yaml", 1)))
-def test_btkd_detection(cfg, nc):
-    """Preserve native detection loss while KD alone trains class/box heads and handles empty labels."""
+@pytest.mark.parametrize("method", ("btkd", "cwd"))
+def test_detection_distillation(cfg, nc, method):
+    """Preserve native loss and student shapes while output/feature KD trains its intended parameters."""
     imgsz = 128 if cfg == "yolov8n.yaml" else 64
     student = DetectionModel(cfg, nc=nc, verbose=False)
-    student.args = get_cfg(overrides={"imgsz": imgsz, "distill_method": "btkd", "dis": 1.0})
+    student.args = get_cfg(overrides={"imgsz": imgsz, "distill_method": method, "dis": 1.0})
     native = deepcopy(student)
     shapes = {name: tuple(p.shape) for name, p in student.named_parameters()}
-    model = DistillationModel(deepcopy(student), student)
-    model.btkd.gamma = 0.5
+    teacher = (
+        DetectionModel("yolo26s.yaml", nc=nc, verbose=False)
+        if method == "cwd" and cfg == "yolo26n.yaml"
+        else deepcopy(student)
+    )
+    model = DistillationModel(teacher, student)
+    if method == "btkd":
+        model.btkd.gamma = 0.5
     batch = {
         "img": torch.rand(2, 3, imgsz, imgsz),
         "batch_idx": torch.tensor([0.0, 1.0]),
@@ -273,21 +310,31 @@ def test_btkd_detection(cfg, nc):
     native_loss, _ = native(batch)
     loss, _ = model(batch)
     torch.testing.assert_close(loss[:-1], native_loss, rtol=0, atol=0)
-    assert len(model.projector) == 0
+    assert len(model.projector) == (0 if method == "btkd" else 3)
     assert shapes == {name: tuple(p.shape) for name, p in student.named_parameters()}
     assert torch.isfinite(loss).all() and loss[-1] > 0
     loss[-1].backward()
     head = student.model[-1]
-    for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
-        branch = getattr(head, name, None)
-        if branch is not None:
-            assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in branch.parameters()), name
+    if method == "btkd":
+        for name in ("cv2", "cv3", "one2one_cv2", "one2one_cv3"):
+            branch = getattr(head, name, None)
+            if branch is not None:
+                assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in branch.parameters()), name
+    else:
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in student.model[0].parameters())
+        assert all(p.grad is None or p.grad.count_nonzero() == 0 for p in head.parameters())
+        for level in model.projector:
+            parameters = list(level.parameters())
+            if parameters:
+                assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in parameters)
     assert all(p.grad is None or torch.isfinite(p.grad).all() for p in student.parameters())
     assert all(not p.requires_grad and p.grad is None for p in model.teacher_model.parameters())
     model.zero_grad(set_to_none=True)
     batch.update(batch_idx=torch.empty(0), cls=torch.empty(0, 1), bboxes=torch.empty(0, 4))
     loss, _ = model(batch)
-    assert torch.isfinite(loss).all() and loss[-1] == 0
+    assert torch.isfinite(loss).all()
+    if method == "btkd":
+        assert loss[-1] == 0
     loss[-1].backward()
 
 
